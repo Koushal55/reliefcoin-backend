@@ -1,84 +1,140 @@
 const express = require('express');
 const router = express.Router();
-const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const User = require('../models/User'); // Import our User model
+const jwt = require('jsonwebtoken');
+const { ethers } = require('ethers');
+const User = require('../models/User');
+const Transaction = require('../models/Transaction'); // --- V2.0: Import Transaction model
+const Beneficiary = require('../models/Beneficiary'); // --- V2.0: Import Beneficiary model
+const Campaign = require('../models/Campaign');
 
-// @route   POST api/auth/register
-// @desc    Register a new user
-// @access  Public
-router.post('/register', async (req, res) => {
-  // Get the data from the request body
-  const { name, email, password, role } = req.body;
-
-  try {
-    // 1. Check if user already exists
-    let user = await User.findOne({ email });
-    if (user) {
-      return res.status(400).json({ msg: 'User already exists' });
+module.exports = function(reliefCoinContract, provider) {
+  
+  // POST api/auth/register (Unchanged)
+  router.post('/register', async (req, res) => {
+    const { name, email, password, role } = req.body;
+    try {
+      let user = await User.findOne({ email });
+      if (user) return res.status(400).json({ msg: 'User already exists' });
+      const wallet = ethers.Wallet.createRandom();
+      user = new User({ name, email, password, role, walletAddress: wallet.address, privateKey: wallet.privateKey });
+      await user.save();
+      // Also create a Beneficiary profile if the role is 'beneficiary'
+      if(role === 'beneficiary') {
+        // We'll use a placeholder phone for now, as the main registration doesn't ask for it
+        const newBeneficiary = new Beneficiary({ name, phone: '0000000000', userAccount: user._id });
+        await newBeneficiary.save();
+      }
+      res.status(201).json({ msg: 'User registered successfully' });
+    } catch (err) {
+      console.error(err.message);
+      res.status(500).send('Server Error');
     }
+  });
 
-    // 2. Create a new user instance
-    user = new User({
-      name,
-      email,
-      password,
-      role,
-    });
-
-    // 3. Save the user to the database
-    // The password will be automatically hashed here because of the pre-save hook in our model
-    await user.save();
-
-    // 4. Send a success response
-    res.status(201).json({ msg: 'User registered successfully' });
-
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server Error');
-  }
-});
-
-// @route   POST api/auth/login
-// @desc    Authenticate user & get token
-router.post('/login', async (req, res) => {
-  const { email, password } = req.body;
-
-  try {
-    // 1. Check if user exists
-    let user = await User.findOne({ email });
-    if (!user) {
-      return res.status(400).json({ msg: 'Invalid credentials' });
-    }
-
-    // 2. Compare the provided password with the hashed password in the DB
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(400).json({ msg: 'Invalid credentials' });
-    }
-
-    // 3. If credentials are correct, create and return a JSON Web Token (JWT)
-    const payload = {
-      user: {
-        id: user.id,
-        role: user.role,
-      },
-    };
-
-    jwt.sign(
-      payload,
-      process.env.MONGO_URI, // Using our secret from .env. In production, use a dedicated JWT secret.
-      { expiresIn: 3600 }, // Token expires in 1 hour
-      (err, token) => {
+  // POST api/auth/login (Unchanged)
+  router.post('/login', async (req, res) => {
+    const { email, password } = req.body;
+    try {
+      let user = await User.findOne({ email });
+      if (!user) return res.status(400).json({ msg: 'Invalid credentials' });
+      const isMatch = await bcrypt.compare(password, user.password);
+      if (!isMatch) return res.status(400).json({ msg: 'Invalid credentials' });
+      const payload = { user: { id: user.id, role: user.role } };
+      jwt.sign(payload, process.env.MONGO_URI, { expiresIn: 3600 }, (err, token) => {
         if (err) throw err;
         res.json({ token });
+      });
+    } catch (err) {
+      console.error(err.message);
+      res.status(500).send('Server Error');
+    }
+  });
+
+  // GET api/auth/balance/:address (Unchanged)
+  router.get('/balance/:address', async (req, res) => {
+    try {
+      const { address } = req.params;
+      const balance = await reliefCoinContract.balanceOf(address);
+      const formattedBalance = ethers.formatUnits(balance, 18);
+      res.json({ address, balance: formattedBalance });
+    } catch (err) {
+      console.error(err.message);
+      res.status(500).send('Server Error');
+    }
+  });
+  
+  // POST api/auth/fund-wallet (Unchanged)
+  router.post('/fund-wallet', async (req, res) => {
+    try {
+      const { address } = req.body;
+      if (!address) return res.status(400).json({ msg: 'Address is required' });
+      const ownerSigner = new ethers.Wallet(process.env.OWNER_PRIVATE_KEY, provider);
+      const tx = await ownerSigner.sendTransaction({
+        to: address,
+        value: ethers.parseEther("1.0")
+      });
+      await tx.wait();
+      res.json({ msg: 'Wallet funded successfully', txHash: tx.hash });
+    } catch (err) {
+      console.error(err.message);
+      res.status(500).send('Server Error');
+    }
+  });
+
+  // --- V2.0: UPDATED "REDEEM" ROUTE ---
+  router.post('/redeem', async (req, res) => {
+    // beneficiaryId is the MongoDB User ID (from the QR)
+    // vendorId is the MongoDB User ID (from the logged-in vendor)
+    const { beneficiaryId, vendorId, amount } = req.body; 
+
+    try {
+      const beneficiaryUser = await User.findById(beneficiaryId).select('+privateKey');
+      const vendorUser = await User.findById(vendorId);
+
+      if (!beneficiaryUser || !vendorUser) {
+        return res.status(404).json({ msg: 'User not found' });
       }
-    );
 
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).send('Server Error');
-  }
-});
+      // 1. Create a signer for the beneficiary
+      const beneficiarySigner = new ethers.Wallet(beneficiaryUser.privateKey, provider);
+      
+      // 2. Connect this signer to the ReliefCoin contract
+      const contractAsBeneficiary = reliefCoinContract.connect(beneficiarySigner);
 
-module.exports = router;
+      // 3. Convert the amount
+      const amountToTransfer = ethers.parseUnits(amount.toString(), 18);
+
+      // 4. Call the 'transfer' function on the contract
+      console.log(`Transferring ${amount} RC from ${beneficiaryUser.name} to ${vendorUser.name}...`);
+      const tx = await contractAsBeneficiary.transfer(vendorUser.walletAddress, amountToTransfer);
+      await tx.wait(); // Wait for the transaction to be mined
+
+      console.log(`Transfer successful! Transaction hash: ${tx.hash}`);
+
+      // 5. --- NEW: Create a record of this transaction in our database ---
+       const firstCampaign = await Campaign.findOne().sort({ createdAt: -1 });
+      let campaignId = firstCampaign ? firstCampaign._id : null;
+
+      const newTransaction = new Transaction({
+          blockchainTxHash: tx.hash,
+          type: 'REDEEM',
+          amount: Number(amount),
+          campaign: campaignId,
+          beneficiary: beneficiaryUser._id,
+          vendor: vendorUser._id
+      });
+      await newTransaction.save();
+      console.log("REDEEM transaction saved to database.");
+      // --- END OF NEW LOGIC ---
+
+      res.json({ msg: 'Redemption successful', txHash: tx.hash });
+
+    } catch (err) {
+      console.error("Error in /redeem route:", err.message);
+      res.status(500).send('Server Error');
+    }
+  });
+  
+  return router;
+};
